@@ -86,6 +86,47 @@ namespace Garnet.server
             }
         }
 
+        /// <summary>
+        /// Collects the context of every live Vector Set index record in the store.
+        /// </summary>
+        private sealed class CollectLiveIndexContextsFunctions : IScanIteratorFunctions
+        {
+            private readonly ConcurrentDictionary<ulong, ushort> liveIndexes;
+
+            public CollectLiveIndexContextsFunctions(ConcurrentDictionary<ulong, ushort> liveIndexes)
+            {
+                this.liveIndexes = liveIndexes;
+            }
+
+            /// <summary>
+            /// Whether the iteration visited at least one record.
+            /// </summary>
+            internal bool ObservedAnyRecord { get; private set; }
+
+            public void OnException(Exception exception, long numberOfRecords) { }
+            public bool OnStart(long beginAddress, long endAddress) => true;
+            public void OnStop(bool completed, long numberOfRecords) { }
+
+            /// <inheritdoc/>
+            public bool Reader<TSourceLogRecord>(in TSourceLogRecord logRecord, RecordMetadata recordMetadata, long numberOfRecords, out CursorRecordResult cursorRecordResult)
+                where TSourceLogRecord : ISourceLogRecord
+            {
+                cursorRecordResult = CursorRecordResult.Skip;
+                ObservedAnyRecord = true;
+
+                if (logRecord.HasNamespace || logRecord.RecordType != RecordType || logRecord.ValueSpan.Length != IndexSize)
+                {
+                    return true;
+                }
+
+                ReadIndex(logRecord.ValueSpan, out var context, out _, out _, out _, out _, out _, out _, out _, out _);
+
+                liveIndexes[context] = HashSlotUtils.HashSlot(logRecord.Key);
+
+                return true;
+            }
+        }
+
         private readonly VectorSetCleanupWorkChannel<object> cleanupTaskChannel;
         private readonly VectorSetCleanupWorkChannel<(ulong Context, TaskCompletionSource MarkCompleted)> requestCleanupTaskChannel;
         private readonly VectorSetCleanupWorkChannel<object> requestDropTaskChannel;
@@ -228,9 +269,21 @@ namespace Garnet.server
                             }
 
                             var (contextIndex, contextValue) = ContextMetadata.DecomposeContext(t.Context);
-                            if (!contextMetadatas[contextIndex].IsCleaningUp(contextIndex != 0, contextValue))
+
+                            // A context that is no longer in use has already been cleaned up in full, so there is
+                            // nothing left to mark - only contexts still holding data can enter cleanup
+                            if (contextMetadatas[contextIndex].IsInUse(contextIndex != 0, contextValue) &&
+                                !contextMetadatas[contextIndex].IsCleaningUp(contextIndex != 0, contextValue))
                             {
                                 contextMetadatas[contextIndex].MarkCleaningUp(contextIndex != 0, contextValue);
+
+                                // A null completion means nobody is waiting on this mark, which identifies the
+                                // speculative requests raised by QueueCleanups from a key that may no longer
+                                // describe the context. Those are the ones the rescue below may undo.
+                                if (t.MarkCompleted == null)
+                                {
+                                    _ = speculativelyMarkedContexts.Add(t.Context);
+                                }
 
                                 _ = dirtyContextMetadatas.Add(contextIndex);
 
@@ -342,6 +395,53 @@ namespace Garnet.server
                         continue;
                     }
 
+                    // A context is only garbage once no index record refers to it, and being marked is not
+                    // evidence of that. QueueCleanups decides a context is abandoned by reading the single key
+                    // it observed during compaction, but publishes cleanup for the whole context: when that key
+                    // is gone while the context lives on under a different key the mark names live data. RENAME
+                    // carries the context to the new key, and a freed context is handed to the next Vector Set
+                    // created. Recovery likewise infers ownership only from the records it happened to observe.
+                    // Re-derive the live set from the store so only genuinely unreferenced contexts are removed.
+                    ConcurrentDictionary<ulong, ushort> liveIndexes = new();
+                    CollectLiveIndexContextsFunctions liveIndexCallbacks = new(liveIndexes);
+                    _ = scanCtx.Session.IterateLookupSnapshot(ref liveIndexCallbacks);
+
+                    if (!liveIndexes.IsEmpty)
+                    {
+                        lock (this)
+                        {
+                            foreach (var live in liveIndexes.Keys)
+                            {
+                                // Only speculative marks are undone. A mark raised by RequestDeletion names the
+                                // very record being deleted, and OnDispose runs before the tombstone is set, so
+                                // that record is still visible to the scan above - rescuing it would abandon the
+                                // elements the delete is in the middle of removing.
+                                if (!speculativelyMarkedContexts.Contains(live))
+                                {
+                                    continue;
+                                }
+
+                                if (!needCleanup.Remove(live))
+                                {
+                                    continue;
+                                }
+
+                                _ = speculativelyMarkedContexts.Remove(live);
+
+                                var (liveIndex, liveValue) = ContextMetadata.DecomposeContext(live);
+                                contextMetadatas[liveIndex].ClearIsCleaningUp(liveIndex != 0, liveValue);
+
+                                _ = dirtyContextMetadatas.Add(liveIndex);
+                            }
+                        }
+
+                        if (needCleanup.Count == 0)
+                        {
+                            UpdateContextMetadata(ref delCtx);
+                            continue;
+                        }
+                    }
+
                     PostDropCleanupFunctions callbacks = new(cleanupSession.storageSession, needCleanup);
 
                     // Scan whole keyspace and remove any associated data using a snapshot
@@ -359,6 +459,8 @@ namespace Garnet.server
                         {
                             var (contextIndex, contextValue) = ContextMetadata.DecomposeContext(cleanedUp);
                             contextMetadatas[contextIndex].FinishedCleaningUp(contextIndex != 0, contextValue);
+
+                            _ = speculativelyMarkedContexts.Remove(cleanedUp);
 
                             _ = dirtyContextMetadatas.Add(contextIndex);
                         }

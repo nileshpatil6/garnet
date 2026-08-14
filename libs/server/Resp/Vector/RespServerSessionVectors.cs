@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 using System;
 using System.Buffers;
@@ -918,13 +918,13 @@ namespace Garnet.server
                         }
                         else if (vectorRes == VectorManagerResult.OK)
                         {
-                            if (respProtocolVersion == 3)
+                            var written = respProtocolVersion == 3
+                                ? WriteRESP3Result(this, count.Value, idResult, distanceResult, filterBitmapResult, withAttributes.Value, withScores.Value, idFormat, attributeResult)
+                                : WriteRESP2Result(this, count.Value, idResult, distanceResult, filterBitmapResult, withAttributes.Value, withScores.Value, idFormat, attributeResult);
+
+                            if (!written)
                             {
-                                WriteRESP3Result(this, count.Value, idResult, distanceResult, filterBitmapResult, withAttributes.Value, withScores.Value, idFormat, attributeResult);
-                            }
-                            else
-                            {
-                                WriteRESP2Result(this, count.Value, idResult, distanceResult, filterBitmapResult, withAttributes.Value, withScores.Value, idFormat, attributeResult);
+                                return AbortVectorSetPartiallyDeleted();
                             }
                         }
                         else if (vectorRes == VectorManagerResult.BadParams)
@@ -974,7 +974,46 @@ namespace Garnet.server
             // If withScores (and not withAttributes) this is a map where keys are bulk string elements and values are double distances
             // If withAttributes (and not withScores) this is a map where keys are bulk string elements and values are bulk string attributes
             // If both withScores and withAttributes this is a map where keys are bulk string elements and values are 2 element arrays with double distances and bulk string attributes (in that order)
-            static void WriteRESP3Result(RespServerSession self, int count, SpanByteAndMemory idResult, SpanByteAndMemory distanceResult, SpanByteAndMemory filterBitmapResult, bool withAttributes, bool withScores, VectorIdFormat idFormat, SpanByteAndMemory attributeResult)
+            // Validate that the id payload actually contains the number of results the search reported.
+            //
+            // Element ids live in their own records; if those records were removed by the background cleanup
+            // of an interrupted delete the native search still reports neighbours it can no longer resolve.
+            // Detecting that here - before any array or map header is emitted - keeps the RESP framing intact.
+            static bool TryValidateResultIds(ReadOnlySpan<byte> ids, VectorIdFormat idFormat, int entryCount)
+            {
+                if (idFormat is not (VectorIdFormat.I32LengthPrefixed or VectorIdFormat.FixedI32))
+                {
+                    // An unknown encoding is an internal defect, not a recoverable data state, so it must not
+                    // be reported to the caller as a partially deleted Vector Set.
+                    throw new GarnetException($"Unexpected id format: {idFormat}");
+                }
+
+                for (var i = 0; i < entryCount; i++)
+                {
+                    if (ids.Length < sizeof(int))
+                    {
+                        return false;
+                    }
+
+                    if (idFormat == VectorIdFormat.FixedI32)
+                    {
+                        ids = ids[sizeof(int)..];
+                        continue;
+                    }
+
+                    var elementLen = BinaryPrimitives.ReadInt32LittleEndian(ids);
+                    if (elementLen < 0 || ids.Length - sizeof(int) < elementLen)
+                    {
+                        return false;
+                    }
+
+                    ids = ids[(sizeof(int) + elementLen)..];
+                }
+
+                return true;
+            }
+
+            static bool WriteRESP3Result(RespServerSession self, int count, SpanByteAndMemory idResult, SpanByteAndMemory distanceResult, SpanByteAndMemory filterBitmapResult, bool withAttributes, bool withScores, VectorIdFormat idFormat, SpanByteAndMemory attributeResult)
             {
                 var remainingIds = idResult.ReadOnlySpan;
                 var distancesSpan = MemoryMarshal.Cast<byte, float>(distanceResult.ReadOnlySpan);
@@ -999,6 +1038,11 @@ namespace Garnet.server
 
                 // Limit to what is actually asked for
                 outputCount = Math.Min(count, outputCount);
+
+                if (!TryValidateResultIds(remainingIds, idFormat, hasFilter ? totalFound : outputCount))
+                {
+                    return false;
+                }
 
                 if (!withAttributes && !withScores)
                 {
@@ -1106,6 +1150,8 @@ namespace Garnet.server
                     resultIndex++;
                     writtenCount++;
                 }
+
+                return true;
             }
 
             // Write VSIM RESP2 result
@@ -1114,7 +1160,7 @@ namespace Garnet.server
             // If withScores (and not withAttributes) then the array size is doubled and every 2nd element is a bulk string of the distance
             // If withAttributes (and not withScores) then the array size is doubled and every 2nd element is a bulk string of the vector's attribute (if any)
             // If both withScores and withAttributes the array size is tripled and every 2nd element is a bulk string of the distance, and every 3rd element is a bulk string of the vector's attribute (if any)
-            static void WriteRESP2Result(RespServerSession self, int count, SpanByteAndMemory idResult, SpanByteAndMemory distanceResult, SpanByteAndMemory filterBitmapResult, bool withAttributes, bool withScores, VectorIdFormat idFormat, SpanByteAndMemory attributeResult)
+            static bool WriteRESP2Result(RespServerSession self, int count, SpanByteAndMemory idResult, SpanByteAndMemory distanceResult, SpanByteAndMemory filterBitmapResult, bool withAttributes, bool withScores, VectorIdFormat idFormat, SpanByteAndMemory attributeResult)
             {
                 var remainingIds = idResult.ReadOnlySpan;
                 var distancesSpan = MemoryMarshal.Cast<byte, float>(distanceResult.ReadOnlySpan);
@@ -1149,6 +1195,11 @@ namespace Garnet.server
                 if (withAttributes)
                 {
                     arrayItemCount += outputCount;
+                }
+
+                if (!TryValidateResultIds(remainingIds, idFormat, hasFilter ? totalFound : outputCount))
+                {
+                    return false;
                 }
 
                 while (!RespWriteUtils.TryWriteArrayLength(arrayItemCount, ref self.dcurr, self.dend))
@@ -1242,6 +1293,8 @@ namespace Garnet.server
                     resultIndex++;
                     writtenCount++;
                 }
+
+                return true;
             }
         }
 
@@ -1883,6 +1936,14 @@ namespace Garnet.server
                     }
                     break;
             }
+
+            return true;
+        }
+
+        private bool AbortVectorSetPartiallyDeleted()
+        {
+            while (!RespWriteUtils.TryWriteError("ERR Vector Set is in a partially deleted state - re-execute DEL to complete deletion"u8, ref dcurr, dend))
+                SendAndReset();
 
             return true;
         }

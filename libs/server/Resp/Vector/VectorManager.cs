@@ -1,10 +1,11 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -172,8 +173,16 @@ namespace Garnet.server
 
         private readonly int dbId;
 
-        private ConcurrentDictionary<ulong, byte> recoveredIndexes;
+        private ConcurrentDictionary<ulong, ushort> recoveredIndexes;
         private ConcurrentDictionary<int, ContextMetadata> recoveredMetadata;
+
+        /// <summary>
+        /// Contexts marked for cleanup on inferred evidence rather than on an actual delete of their
+        /// index record: recovery, which can only reason about the records it observed, and QueueCleanups,
+        /// which decides from a single key but acts on the whole context. Only these may be un-marked by
+        /// the liveness rescue in the cleanup task. Guarded by <c>lock (this)</c>.
+        /// </summary>
+        private readonly HashSet<ulong> speculativelyMarkedContexts = [];
 
         public VectorManager(int dbId, GarnetServerOptions serverOptions, Func<IMessageConsumer> getTempSession, ILoggerFactory loggerFactory)
         {
@@ -272,10 +281,33 @@ namespace Garnet.server
 
             ref var ctx = ref session.storageSession.vectorBasicContext;
 
+            // Index records are only reported to RecoveredVectorSetIndexKey while reading a checkpoint
+            // snapshot, but AOF replay runs afterwards and can introduce index records that were never
+            // part of the snapshot. Scanning the store finds every live index regardless of how it got
+            // here, which is what deciding whether a context is still owned requires.
+            //
+            // The scan collects into a fresh map rather than merging into the snapshot-derived one: an
+            // index that the snapshot reported but AOF replay then deleted is absent from the store, and
+            // merging would keep it alive, re-reserving a context whose delete is still pending.
+            ConcurrentDictionary<ulong, ushort> liveIndexes = new();
+            CollectLiveIndexContextsFunctions collectLiveIndexes = new(liveIndexes);
+            _ = session.storageSession.stringBasicContext.Session.IterateLookupSnapshot(ref collectLiveIndexes);
+
+            // Absence of an index record is only evidence when the scan actually observed records; an
+            // empty scan says nothing about which contexts are still owned.
+            var observedStore = collectLiveIndexes.ObservedAnyRecord;
+
             var needsUpdated = false;
 
             lock (this)
             {
+                // Recovery runs before the server accepts connections, so nothing creates Vector Sets
+                // concurrently and a completed scan is the authoritative census of live indexes.
+                if (observedStore)
+                {
+                    recoveredIndexes = liveIndexes;
+                }
+
                 if (requireNoReservedContexts)
                 {
                     for (var i = 0; i < contextMetadatas.Length; i++)
@@ -305,6 +337,26 @@ namespace Garnet.server
 
                 recoveredMetadata.Clear();
 
+                // The rebuild above only covers blocks that were persisted, but an index record can name a
+                // context in a block allocated after the last metadata write - the index record is written
+                // first, and AOF replay allocates further blocks with no snapshot behind them. Grow to cover
+                // every context still referenced so the reservation below can be restored.
+                var maxReferencedIndex = contextMetadatas.Length - 1;
+                foreach (var context in recoveredIndexes.Keys)
+                {
+                    var (contextIndex, _) = ContextMetadata.DecomposeContext(context);
+
+                    maxReferencedIndex = Math.Max(maxReferencedIndex, contextIndex);
+                }
+
+                if (maxReferencedIndex >= contextMetadatas.Length)
+                {
+                    var grownContextMetadatas = new ContextMetadata[maxReferencedIndex + 1];
+                    contextMetadatas.AsSpan().CopyTo(grownContextMetadatas);
+
+                    contextMetadatas = grownContextMetadatas;
+                }
+
                 // If we come up and contexts are marked for migration, that means the migration FAILED
                 // and we'd like those contexts back ASAP
                 for (var i = 0; i < contextMetadatas.Length; i++)
@@ -317,6 +369,7 @@ namespace Garnet.server
                         {
                             contextMetadatas[i].MarkMigrationComplete(i != 0, abandoned, ushort.MaxValue);
                             contextMetadatas[i].MarkCleaningUp(i != 0, abandoned);
+                            _ = speculativelyMarkedContexts.Add(ContextMetadata.OffsetForContextMetadata(i) + abandoned);
                         }
 
                         _ = dirtyContextMetadatas.Add(i);
@@ -326,9 +379,21 @@ namespace Garnet.server
                 }
 
                 // Any non-deleted records we recovered for contexts being deleted, we need to undo that
-                foreach (var (context, _) in recoveredIndexes)
+                foreach (var (context, hashSlot) in recoveredIndexes)
                 {
                     var (contextIndex, contextValue) = ContextMetadata.DecomposeContext(context);
+
+                    // The index record is written before the context metadata that reserves its context, so a
+                    // recovery boundary between the two leaves a live index record pointing at a free context.
+                    // Reserving it here keeps the context from being handed to a different Vector Set.
+                    if (!contextMetadatas[contextIndex].IsInUse(contextIndex != 0, contextValue))
+                    {
+                        contextMetadatas[contextIndex].MarkInUse(contextIndex != 0, contextValue, hashSlot);
+
+                        _ = dirtyContextMetadatas.Add(contextIndex);
+
+                        needsUpdated = true;
+                    }
 
                     if (contextMetadatas[contextIndex].IsCleaningUp(contextIndex != 0, contextValue))
                     {
@@ -340,8 +405,11 @@ namespace Garnet.server
                     }
                 }
 
-                // Any indexes still marked in use that we _didn't_ recover should be marked for cleanup
-                for (var i = 0; i < contextMetadatas.Length; i++)
+                // Any indexes still marked in use that we _didn't_ recover should be marked for cleanup.
+                // Absence of an index record is only meaningful when the store was actually observed, so
+                // skip reclaiming contexts when the scan above came up empty rather than treat every
+                // reservation as garbage.
+                for (var i = 0; observedStore && i < contextMetadatas.Length; i++)
                 {
                     var offset = ContextMetadata.OffsetForContextMetadata(i);
 
@@ -368,6 +436,7 @@ namespace Garnet.server
                         if (contextMetadatas[i].IsInUse(i != 0, contextValue) && !contextMetadatas[i].IsCleaningUp(i != 0, contextValue))
                         {
                             contextMetadatas[i].MarkCleaningUp(i != 0, contextValue);
+                            _ = speculativelyMarkedContexts.Add(context);
                             _ = dirtyContextMetadatas.Add(i);
                         }
                     }
@@ -396,7 +465,7 @@ namespace Garnet.server
             }
 
             ReadIndex(record.ValueSpan, out var context, out _, out _, out _, out _, out _, out _, out _, out _);
-            recoveredIndexes[context] = 0;
+            recoveredIndexes[context] = HashSlotUtils.HashSlot(record.Key);
         }
 
         /// <summary>
